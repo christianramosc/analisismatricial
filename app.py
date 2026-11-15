@@ -8,10 +8,12 @@ import copy
 import json
 import math
 import io
+import re
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 import analisis_matricial_marcos as motor
@@ -27,16 +29,18 @@ NARANJA = "#d68910"
 # ---------------------------------------------------------------------
 COLUMNAS = {
     "nodos": ["id", "x", "y"],
-    "barras": ["id", "i", "j", "E", "A", "I", "art_i", "art_j"],
+    "barras": ["id", "i", "j", "E", "A", "I", "art_i", "art_j", "gamma"],
     "apoyos": ["nodo", "rx", "ry", "rz"],
     "resortes": ["nodo", "kx", "ky", "kz"],
-    "cargas_nodales": ["nodo", "Fx", "Fy", "M"],
-    "cargas_barras": ["barra", "tipo", "dir", "w1", "w2", "a", "b", "P"],
+    "cargas_nodales": ["nodo", "Fx", "Fy", "M", "caso"],
+    "cargas_barras": ["barra", "tipo", "dir", "w1", "w2", "a", "b", "P", "M", "dT", "dTg", "h", "caso"],
     "asentamientos": ["nodo", "dx", "dy", "giro"],
+    "combinaciones": ["nombre", "factores"],
 }
 BOOL_COLS = {"barras": ["art_i", "art_j"], "apoyos": ["rx", "ry", "rz"]}
-TEXTO_COLS = {"cargas_barras": ["tipo", "dir"]}
-TIPOS_CARGA = ["distribuida", "puntual"]
+TEXTO_COLS = {"cargas_barras": ["tipo", "dir", "caso"], "cargas_nodales": ["caso"],
+              "combinaciones": ["nombre", "factores"]}
+TIPOS_CARGA = ["distribuida", "puntual", "momento", "termica"]
 DIRS = ["global_y", "global_x", "local_y", "local_x", "global_y_proy", "global_x_proy"]
 APOYOS_PRESET = {
     "Empotre": (1, 1, 1),
@@ -80,7 +84,8 @@ def modelo_a_tablas(mod):
         if isinstance(d, (list, tuple)):
             d = {"i": d[0], "j": d[1]}
         filas.append({"id": k, "i": d["i"], "j": d["j"], "E": d.get("E"), "A": d.get("A"), "I": d.get("I"),
-                      "art_i": bool(d.get("art_i", False)), "art_j": bool(d.get("art_j", False))})
+                      "art_i": bool(d.get("art_i", False)), "art_j": bool(d.get("art_j", False)),
+                      "gamma": d.get("gamma")})
     t["barras"] = pd.DataFrame(filas)
 
     def trip(v):
@@ -91,24 +96,54 @@ def modelo_a_tablas(mod):
                                 for k, v in mod.get("apoyos", {}).items()])
     t["resortes"] = pd.DataFrame([dict(zip(["nodo", "kx", "ky", "kz"], [k] + trip(v)))
                                   for k, v in (mod.get("resortes") or {}).items()])
-    t["cargas_nodales"] = pd.DataFrame([dict(zip(["nodo", "Fx", "Fy", "M"], [k] + trip(v)))
-                                        for k, v in (mod.get("cargas_nodales") or {}).items()])
+    cn = mod.get("cargas_nodales") or {}
+    if isinstance(cn, dict):
+        cn = [dict(zip(["nodo", "Fx", "Fy", "M"], [k] + trip(v))) for k, v in cn.items()]
+    t["cargas_nodales"] = pd.DataFrame([{c: f.get(c) for c in COLUMNAS["cargas_nodales"]} for f in cn])
     t["cargas_barras"] = pd.DataFrame([{c: cb.get(c) for c in COLUMNAS["cargas_barras"]}
                                        for cb in (mod.get("cargas_barras") or [])])
     t["asentamientos"] = pd.DataFrame([dict(zip(["nodo", "dx", "dy", "giro"], [k] + trip(v)))
                                        for k, v in (mod.get("asentamientos") or {}).items()])
+    t["combinaciones"] = pd.DataFrame([{"nombre": str(k), "factores": motor.texto_combinacion(v)}
+                                       for k, v in (mod.get("combinaciones") or {}).items()])
     return {k: (_tipar(k, v) if len(v) else _vacio(k)) for k, v in t.items()}
+
+
+def leer_factores(texto):
+    """'1.3 CM + 1.5 CV - S'  ->  {'CM': 1.3, 'CV': 1.5, 'S': -1.0}.  Devuelve None si no se entiende."""
+    if not isinstance(texto, str) or not texto.strip():
+        return None
+    limpio = texto.replace("·", " ").replace("*", " ").replace(",", ".")
+    patron = re.compile(r"\s*([+-]?)\s*(\d+\.?\d*|\.\d+)?\s*([A-Za-zÁÉÍÓÚÑáéíóúñ_]\w*)")
+    pos, out = 0, {}
+    while pos < len(limpio) and limpio[pos:].strip():
+        m = patron.match(limpio, pos)
+        if not m:
+            return None
+        f = float(m.group(2)) if m.group(2) else 1.0
+        if m.group(1) == "-":
+            f = -f
+        caso = m.group(3).upper()
+        out[caso] = out.get(caso, 0.0) + f
+        pos = m.end()
+    return out or None
+
+
+def _txt(v, defecto=""):
+    return v.strip() if isinstance(v, str) and v.strip() else defecto
 
 
 def _ok(v):
     return v is not None and not (isinstance(v, float) and math.isnan(v)) and not pd.isna(v)
 
 
-def tablas_a_modelo(t, E, A, I, titulo):
-    """Convierte las tablas al formato del motor. Devuelve (modelo, lista_de_avisos)."""
+def tablas_a_modelo(t, E, A, I, titulo, extra=None):
+    """Convierte las tablas al formato del motor. Devuelve (modelo, lista_de_avisos).
+    extra: dict opcional con peso_propio, gamma, caso_pp, alpha."""
     avisos = []
     mod = {"titulo": titulo, "E": E, "A": A, "I": I, "nodos": {}, "barras": {}, "apoyos": {}, "resortes": {},
-           "cargas_nodales": {}, "cargas_barras": [], "asentamientos": {}}
+           "cargas_nodales": [], "cargas_barras": [], "asentamientos": {}, "combinaciones": {}}
+    mod.update(extra or {})
     for _, r in t["nodos"].iterrows():
         if _ok(r["id"]) and _ok(r["x"]) and _ok(r["y"]):
             nid = int(r["id"])
@@ -121,7 +156,7 @@ def tablas_a_modelo(t, E, A, I, titulo):
     for _, r in t["barras"].iterrows():
         if _ok(r["id"]) and _ok(r["i"]) and _ok(r["j"]):
             d = {"i": int(r["i"]), "j": int(r["j"]), "art_i": bool(r["art_i"]), "art_j": bool(r["art_j"])}
-            for c in ("E", "A", "I"):
+            for c in ("E", "A", "I", "gamma"):
                 if _ok(r[c]):
                     d[c] = float(r[c])
             mod["barras"][int(r["id"])] = d
@@ -130,21 +165,35 @@ def tablas_a_modelo(t, E, A, I, titulo):
     for _, r in t["apoyos"].iterrows():
         if _ok(r["nodo"]):
             mod["apoyos"][int(r["nodo"])] = (int(bool(r["rx"])), int(bool(r["ry"])), int(bool(r["rz"])))
-    for nombre, cols in (("resortes", ["kx", "ky", "kz"]), ("cargas_nodales", ["Fx", "Fy", "M"]),
-                         ("asentamientos", ["dx", "dy", "giro"])):
+    for nombre, cols in (("resortes", ["kx", "ky", "kz"]), ("asentamientos", ["dx", "dy", "giro"])):
         for _, r in t[nombre].iterrows():
             if _ok(r["nodo"]):
-                v = tuple(float(r[c]) if _ok(r[c]) else 0.0 for c in cols)
-                n = int(r["nodo"])
-                if nombre == "cargas_nodales" and n in mod[nombre]:
-                    v = tuple(a + b for a, b in zip(mod[nombre][n], v))
-                mod[nombre][n] = v
+                mod[nombre][int(r["nodo"])] = tuple(float(r[c]) if _ok(r[c]) else 0.0 for c in cols)
+    for _, r in t["cargas_nodales"].iterrows():
+        if _ok(r["nodo"]):
+            mod["cargas_nodales"].append({"nodo": int(r["nodo"]), "caso": _txt(r["caso"], motor.CASO_DEF).upper(),
+                                          **{c: float(r[c]) if _ok(r[c]) else 0.0 for c in ("Fx", "Fy", "M")}})
     for _, r in t["cargas_barras"].iterrows():
         if not _ok(r["barra"]):
             continue
         tipo = r["tipo"] if isinstance(r["tipo"], str) and r["tipo"] else "distribuida"
-        c = {"barra": int(r["barra"]), "tipo": tipo, "dir": r["dir"] if isinstance(r["dir"], str) and r["dir"] else "global_y"}
-        if tipo.startswith("dist"):
+        c = {"barra": int(r["barra"]), "tipo": tipo, "dir": r["dir"] if isinstance(r["dir"], str) and r["dir"] else "global_y",
+             "caso": _txt(r["caso"], motor.CASO_DEF).upper()}
+        if tipo.startswith("mom"):
+            if not _ok(r["M"]):
+                avisos.append(f"Momento en barra {c['barra']} sin M: se ignoró.")
+                continue
+            c["M"] = float(r["M"])
+            if _ok(r["a"]):
+                c["a"] = float(r["a"])
+        elif tipo.startswith("ter"):
+            if not (_ok(r["dT"]) or _ok(r["dTg"])):
+                avisos.append(f"Carga térmica en barra {c['barra']} sin dT ni dTg: se ignoró.")
+                continue
+            for k in ("dT", "dTg", "h"):
+                if _ok(r[k]):
+                    c[k] = float(r[k])
+        elif tipo.startswith("dist"):
             if not _ok(r["w1"]):
                 avisos.append(f"Carga distribuida en barra {c['barra']} sin w1: se ignoró.")
                 continue
@@ -160,6 +209,24 @@ def tablas_a_modelo(t, E, A, I, titulo):
             if _ok(r["a"]):
                 c["a"] = float(r["a"])
         mod["cargas_barras"].append(c)
+    for _, r in t["combinaciones"].iterrows():
+        nombre, texto = _txt(r["nombre"]), _txt(r["factores"])
+        if not nombre and not texto:
+            continue
+        fac = leer_factores(texto)
+        if not nombre or fac is None:
+            avisos.append(f"Combinación '{nombre or texto}' no se entendió y se ignoró. "
+                          "Escríbela como: 1.3 CM + 1.5 CV")
+            continue
+        mod["combinaciones"][nombre] = fac
+    if mod["combinaciones"]:
+        casos = ({c["caso"] for c in mod["cargas_nodales"]} | {c["caso"] for c in mod["cargas_barras"]}
+                 | ({str(mod.get("caso_pp") or motor.CASO_DEF).upper()} if mod.get("peso_propio") else set()))
+        usados = {k for f in mod["combinaciones"].values() for k in f}
+        if usados - casos:
+            avisos.append(f"Las combinaciones usan casos sin cargas: {', '.join(sorted(usados - casos))}.")
+        if casos - usados:
+            avisos.append(f"Hay casos de carga que no entran en ninguna combinación: {', '.join(sorted(casos - usados))}.")
     return mod, avisos
 
 
@@ -187,9 +254,27 @@ def ejemplos():
               "cargas_barras": [{"barra": 2, "tipo": "distribuida", "w1": -6, "dir": "global_y_proy"},
                                 {"barra": 3, "tipo": "distribuida", "w1": -6, "dir": "global_y_proy"},
                                 {"barra": 1, "tipo": "distribuida", "w1": 3, "dir": "global_x"}]}
+    combos = {"titulo": "Marco con casos y combinaciones de carga", "E": 200e6, "A": 0.006, "I": 1.2e-4,
+              "nodos": {1: (0, 0), 2: (0, 3.5), 3: (6, 3.5), 4: (6, 0)},
+              "barras": {1: {"i": 1, "j": 2}, 2: {"i": 2, "j": 3, "I": 2.0e-4}, 3: {"i": 4, "j": 3}},
+              "apoyos": {1: (1, 1, 1), 4: (1, 1, 1)}, "peso_propio": True, "gamma": 77.0,
+              "cargas_nodales": [{"nodo": 2, "Fx": 12, "Fy": 0, "M": 0, "caso": "VIENTO"}],
+              "cargas_barras": [{"barra": 2, "tipo": "distribuida", "w1": -12, "dir": "global_y", "caso": "CM"},
+                                {"barra": 2, "tipo": "distribuida", "w1": -9, "dir": "global_y", "caso": "CV"},
+                                {"barra": 2, "tipo": "puntual", "P": -25, "a": 2.0, "dir": "global_y", "caso": "CV"}],
+              "combinaciones": {"Servicio": {"CM": 1.0, "CV": 1.0}, "Resistencia": {"CM": 1.3, "CV": 1.5},
+                                "Con viento": {"CM": 1.1, "CV": 1.1, "VIENTO": 1.1}}}
+    termico = {"titulo": "Viga con temperatura y momento concentrado", "E": 200e6, "A": 0.006, "I": 1.2e-4,
+               "nodos": {1: (0, 0), 2: (5, 0), 3: (10, 0)},
+               "barras": {1: {"i": 1, "j": 2}, 2: {"i": 2, "j": 3}},
+               "apoyos": {1: (1, 1, 1), 2: (0, 1, 0), 3: (1, 1, 0)},
+               "cargas_barras": [{"barra": 1, "tipo": "termica", "dT": 25, "dTg": 15, "h": 0.3},
+                                 {"barra": 2, "tipo": "termica", "dT": 25},
+                                 {"barra": 2, "tipo": "momento", "M": 30, "a": 2.5}]}
     vacio = {"titulo": "Estructura nueva", "E": 200e6, "A": 0.006, "I": 1.2e-4, "nodos": {}, "barras": {}}
     return {"Marco con voladizo": copy.deepcopy(motor.MODELO), "Viga continua": viga,
-            "Armadura": armadura, "Marco triarticulado": triart, "Vacío": vacio}
+            "Armadura": armadura, "Marco triarticulado": triart, "Marco con combinaciones": combos,
+            "Temperatura y momento": termico, "Vacío": vacio}
 
 
 # ---------------------------------------------------------------------
@@ -208,6 +293,9 @@ def _cargar_modelo(mod):
     ss.E_def = float(mod.get("E") or 200e6)
     ss.A_def = float(mod.get("A") or 0.006)
     ss.I_def = float(mod.get("I") or 1.2e-4)
+    ss.pp = bool(mod.get("peso_propio", False))
+    ss.gamma_def = float(mod.get("gamma") or motor.GAMMA_ACERO)
+    ss.alpha_def = float(mod.get("alpha") or 1.2e-5)
     ajustar_cuadricula()
 
 
@@ -308,7 +396,7 @@ def aplicar_clic(tablas, punto, modo, op, pendiente):
             return t, nid, f"Ya existe una barra entre {pendiente} y {nid}.", creado
         bid = _siguiente_id(t["barras"]["id"])
         fila = pd.DataFrame([{"id": bid, "i": pendiente, "j": nid, "E": np.nan, "A": np.nan, "I": np.nan,
-                              "art_i": False, "art_j": False}])
+                              "art_i": False, "art_j": False, "gamma": np.nan}])
         t["barras"] = _tipar("barras", pd.concat([t["barras"], fila], ignore_index=True))
         sig = nid if op.get("encadenar", True) else None
         return t, sig, f"Barra {bid} creada ({pendiente} a {nid}).", True
@@ -330,13 +418,15 @@ def aplicar_clic(tablas, punto, modo, op, pendiente):
         if nid is None:
             return tablas, pendiente, "Toca un nodo existente para cargarlo.", False
         cn = t["cargas_nodales"]
-        cn = cn[cn["nodo"] != nid]
+        caso = _txt(op.get("caso"), motor.CASO_DEF).upper()
+        mismo = cn["caso"].map(lambda v: _txt(v, motor.CASO_DEF).upper()) == caso
+        cn = cn[~((cn["nodo"] == nid) & mismo)]
         if any(abs(v) > 0 for v in (op["Fx"], op["Fy"], op["M"])):
-            cn = pd.concat([cn, pd.DataFrame([{"nodo": nid, "Fx": op["Fx"], "Fy": op["Fy"], "M": op["M"]}])],
-                           ignore_index=True)
-            msg = f"Carga asignada al nodo {nid}."
+            cn = pd.concat([cn, pd.DataFrame([{"nodo": nid, "Fx": op["Fx"], "Fy": op["Fy"], "M": op["M"],
+                                               "caso": caso}])], ignore_index=True)
+            msg = f"Carga ({caso}) asignada al nodo {nid}."
         else:
-            msg = f"Cargas del nodo {nid} eliminadas."
+            msg = f"Cargas {caso} del nodo {nid} eliminadas."
         t["cargas_nodales"] = _tipar("cargas_nodales", cn)
         return t, pendiente, msg, True
 
@@ -344,11 +434,19 @@ def aplicar_clic(tablas, punto, modo, op, pendiente):
         if tipo != "b":
             return tablas, pendiente, "Toca el rombo naranja al centro de una barra.", False
         bid = int(punto["id"])
-        fila = {"barra": bid, "tipo": op["tipo"], "dir": op["dir"], "w1": np.nan, "w2": np.nan,
-                "a": np.nan, "b": np.nan, "P": np.nan}
+        fila = {c: np.nan for c in COLUMNAS["cargas_barras"]}
+        fila.update({"barra": bid, "tipo": op["tipo"], "dir": op.get("dir", "global_y"),
+                     "caso": _txt(op.get("caso"), motor.CASO_DEF).upper()})
         if op["tipo"] == "distribuida":
             fila["w1"] = op["w1"]
             fila["w2"] = op["w2"]
+        elif op["tipo"] == "momento":
+            fila["M"] = op["M"]
+            fila["a"] = op["a"]
+        elif op["tipo"] == "termica":
+            fila["dT"] = op["dT"]
+            fila["dTg"] = op["dTg"]
+            fila["h"] = op["h"]
         else:
             fila["P"] = op["P"]
             fila["a"] = op["a"]
@@ -509,7 +607,21 @@ def figura(t, pendiente, grid):
             continue
         c, s = (xj - xi) / L, (yj - yi) / L
         gxv, gyv = _gvec(r.dir if isinstance(r.dir, str) else "global_y", c, s)
-        if str(r.tipo).startswith("pun"):
+        if str(r.tipo).startswith("mom"):
+            if pd.isna(r.M):
+                continue
+            a = L / 2 if pd.isna(r.a) else float(r.a)
+            anot.append(dict(x=xi + c * a, y=yi + s * a, yshift=22, showarrow=False,
+                             text=f"{'↺' if r.M > 0 else '↻'} {abs(r.M):g} kN·m", font=dict(color=ROJO, size=12),
+                             bgcolor="rgba(255,255,255,0.8)"))
+        elif str(r.tipo).startswith("ter"):
+            partes = ([] if pd.isna(r.dT) or not r.dT else [f"ΔT {r.dT:g}°C"]) + \
+                     ([] if pd.isna(r.dTg) or not r.dTg else [f"ΔTg {r.dTg:g}°C"])
+            if partes:
+                anot.append(dict(x=xi + c * L * 0.3, y=yi + s * L * 0.3, yshift=-20, showarrow=False,
+                                 text=", ".join(partes), font=dict(color="#8e44ad", size=11),
+                                 bgcolor="rgba(255,255,255,0.85)", bordercolor="#8e44ad", borderwidth=1))
+        elif str(r.tipo).startswith("pun"):
             if pd.isna(r.P):
                 continue
             a = L / 2 if pd.isna(r.a) else float(r.a)
@@ -542,10 +654,69 @@ def figura(t, pendiente, grid):
 
 
 # ---------------------------------------------------------------------
+# Figura de detalle por barra (resultados)
+# ---------------------------------------------------------------------
+def figura_barra(m, env_b=None):
+    """Diagramas N, V, M y deflexión de una barra, con valores al pasar el dedo o el cursor."""
+    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.07,
+                        subplot_titles=("Axial N (kN), + tensión", "Cortante V (kN)",
+                                        "Momento M (kN·m), dibujado del lado en tensión",
+                                        "Deflexión local v (mm), + hacia +y local"))
+    series = [("N", m["N"], "#27ae60"), ("V", m["V"], "#2471a3"), ("M", m["M"], ROJO),
+              ("v", m["def_v"] * 1000, "#6c3483")]
+    for k, (clave, y, col) in enumerate(series, 1):
+        fig.add_trace(go.Scatter(x=m["x"], y=y, mode="lines", line=dict(color=col, width=2), fill="tozeroy",
+                                 name=clave, hovertemplate="x = %{x:.3f} m<br>" + clave + " = %{y:.3f}<extra></extra>"),
+                      row=k, col=1)
+        if env_b is not None and clave in ("N", "V", "M"):
+            for lim in ("_max", "_min"):
+                fig.add_trace(go.Scatter(x=env_b["x"], y=env_b[clave + lim], mode="lines",
+                                         line=dict(color="#7f8c8d", width=1.2, dash="dot"), name="envolvente",
+                                         hovertemplate="x = %{x:.3f} m<br>envolvente = %{y:.3f}<extra></extra>"),
+                              row=k, col=1)
+    fig.update_yaxes(autorange="reversed", row=3, col=1)
+    fig.update_xaxes(title_text="x desde el nodo i (m)", row=4, col=1)
+    fig.update_layout(height=820, showlegend=False, margin=dict(l=10, r=10, t=40, b=10), dragmode=False,
+                      plot_bgcolor="white", paper_bgcolor="white")
+    fig.update_xaxes(gridcolor="#eef2f6", zerolinecolor="#95a5a6")
+    fig.update_yaxes(gridcolor="#eef2f6", zerolinecolor="#95a5a6")
+    return fig
+
+
+def leer_ids(texto):
+    """'1, 3-5'  ->  {1, 3, 4, 5}"""
+    out = set()
+    for parte in re.split(r"[,\s;]+", str(texto or "").strip()):
+        if not parte:
+            continue
+        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", parte)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            out |= set(range(min(a, b), max(a, b) + 1))
+        elif parte.isdigit():
+            out.add(int(parte))
+    return out
+
+
+# ---------------------------------------------------------------------
 # Interfaz
 # ---------------------------------------------------------------------
 init()
 ss = st.session_state
+
+# Sesiones abiertas antes de una actualización: completa tablas y opciones nuevas
+for _n in COLUMNAS:
+    if _n not in ss.tablas or list(ss.tablas[_n].columns) != COLUMNAS[_n]:
+        ss.tablas[_n] = _tipar(_n, ss.tablas[_n]) if _n in ss.tablas else _vacio(_n)
+        ss.base[_n] = copy.deepcopy(ss.tablas[_n])
+        ss.ver += 1
+for _k, _v in (("pp", False), ("gamma_def", motor.GAMMA_ACERO), ("alpha_def", 1.2e-5)):
+    if _k not in ss:
+        ss[_k] = _v
+
+
+def _extra():
+    return {"peso_propio": bool(ss.pp), "gamma": float(ss.gamma_def), "alpha": float(ss.alpha_def)}
 
 
 def _cb_ejemplo():
@@ -563,6 +734,43 @@ def _cb_json():
         ss.msg = ("error", f"No se pudo leer el archivo: {e}")
 
 
+def _cb_usar_seccion(A, I, E, gamma):
+    ss.A_def, ss.I_def = float(A), float(I)
+    if E:
+        ss.E_def = float(E)
+    if gamma:
+        ss.gamma_def = float(gamma)
+    ss.msg = ("ok", "Sección y material puestos como valores por defecto.")
+
+
+def _cb_aplicar_barras(A, I, E, gamma):
+    ids_ = leer_ids(ss.get("calc_barras", ""))
+    t = copy.deepcopy(ss.tablas)
+    mask = t["barras"]["id"].isin(ids_)
+    if not ids_ or not mask.any():
+        ss.msg = ("error", "Escribe los números de barra a modificar, por ejemplo: 1, 3-5")
+        return
+    t["barras"].loc[mask, "A"] = float(A)
+    t["barras"].loc[mask, "I"] = float(I)
+    if E:
+        t["barras"].loc[mask, "E"] = float(E)
+    if gamma:
+        t["barras"].loc[mask, "gamma"] = float(gamma)
+    aplicar_tablas(t)
+    ss.msg = ("ok", f"Sección aplicada a las barras {sorted(int(v) for v in t['barras'].loc[mask, 'id'])}.")
+
+
+def _cb_combos_tipicas():
+    t = copy.deepcopy(ss.tablas)
+    ya = {_txt(v) for v in t["combinaciones"]["nombre"]}
+    nuevas = [f for f in ({"nombre": "Servicio", "factores": "1 CM + 1 CV"},
+                          {"nombre": "Resistencia", "factores": "1.3 CM + 1.5 CV"}) if f["nombre"] not in ya]
+    if nuevas:
+        t["combinaciones"] = _tipar("combinaciones", pd.concat([t["combinaciones"], pd.DataFrame(nuevas)],
+                                                              ignore_index=True))
+        aplicar_tablas(t)
+
+
 with st.sidebar:
     st.header("Modelo")
     st.text_input("Título", key="titulo")
@@ -573,6 +781,61 @@ with st.sidebar:
     st.number_input("E (kPa)", key="E_def", format="%.4e", min_value=0.0)
     st.number_input("A (m²)", key="A_def", format="%.4e", min_value=0.0)
     st.number_input("I (m⁴)", key="I_def", format="%.4e", min_value=0.0)
+
+    with st.expander("Calculadora de sección y material"):
+        forma = st.selectbox("Forma", ["Rectangular", "Circular", "Tubo circular", "Cajón / PTR", "Perfil I"])
+        cm = 0.01
+        try:
+            if forma == "Rectangular":
+                sec = motor.seccion_rectangular(st.number_input("Base b (cm)", value=30.0, min_value=0.1) * cm,
+                                                st.number_input("Peralte h (cm)", value=60.0, min_value=0.1) * cm)
+            elif forma == "Circular":
+                sec = motor.seccion_circular(st.number_input("Diámetro (cm)", value=40.0, min_value=0.1) * cm)
+            elif forma == "Tubo circular":
+                sec = motor.seccion_tubo_circular(st.number_input("Diámetro exterior (cm)", value=21.9, min_value=0.1) * cm,
+                                                  st.number_input("Espesor (cm)", value=0.8, min_value=0.01) * cm)
+            elif forma == "Cajón / PTR":
+                sec = motor.seccion_cajon(st.number_input("Ancho b (cm)", value=15.0, min_value=0.1) * cm,
+                                          st.number_input("Peralte h (cm)", value=20.0, min_value=0.1) * cm,
+                                          st.number_input("Espesor (cm)", value=0.64, min_value=0.01) * cm)
+            else:
+                sec = motor.seccion_I(st.number_input("Peralte total d (cm)", value=30.0, min_value=0.1) * cm,
+                                      st.number_input("Ancho de patín bf (cm)", value=15.0, min_value=0.1) * cm,
+                                      st.number_input("Espesor de patín tf (cm)", value=1.0, min_value=0.01) * cm,
+                                      st.number_input("Espesor de alma tw (cm)", value=0.6, min_value=0.01) * cm)
+        except ValueError as e:
+            sec = None
+            st.error(str(e))
+        material = st.selectbox("Material", ["Acero (E = 200 GPa)", "Concreto, ACI 318: 4700·√f'c",
+                                             "Concreto, NTC clase 1: 4400·√f'c", "No cambiar E"],
+                                index=1 if forma in ("Rectangular", "Circular") else 0, key=f"mat_{forma}")
+        E_calc, gamma_calc = None, None
+        if material.startswith("Acero"):
+            E_calc, gamma_calc = 200e6, motor.GAMMA_ACERO
+        elif material.startswith("Concreto"):
+            fc = st.number_input("f'c (kg/cm²)", value=250.0, min_value=50.0, step=50.0)
+            E_calc = motor.E_concreto(fc * 0.0980665, "NTC" if "NTC" in material else "ACI")
+            gamma_calc = motor.GAMMA_CONCRETO
+        if sec:
+            st.markdown(f"**A** = {sec['A']:.4e} m² ({sec['A'] * 1e4:.1f} cm²)  \n"
+                        f"**I** = {sec['I']:.4e} m⁴ ({sec['I'] * 1e8:.0f} cm⁴)"
+                        + (f"  \n**E** = {E_calc:.4e} kPa" if E_calc else ""))
+            st.caption("I respecto al eje de flexión en el plano del marco. El módulo del concreto es aproximado: "
+                       "confirma la expresión con tu reglamento.")
+            st.button("Usar como valores por defecto", on_click=_cb_usar_seccion,
+                      args=(sec["A"], sec["I"], E_calc, gamma_calc), width="stretch")
+            st.text_input("O aplicar solo a las barras", key="calc_barras", placeholder="1, 3-5")
+            st.button("Aplicar a esas barras", on_click=_cb_aplicar_barras,
+                      args=(sec["A"], sec["I"], E_calc, gamma_calc), width="stretch")
+
+    st.subheader("Peso propio y temperatura")
+    st.checkbox("Incluir peso propio (caso CM)", key="pp",
+                help="Agrega a cada barra una carga hacia abajo igual a su peso volumétrico por su área.")
+    st.number_input("Peso volumétrico γ (kN/m³)", key="gamma_def", min_value=0.0, step=1.0,
+                    help="Acero 77, concreto reforzado 24. Cada barra puede tener el suyo en la tabla de barras.")
+    st.number_input("Coef. de dilatación α (1/°C)", key="alpha_def", format="%.2e", min_value=0.0,
+                    help="Acero 1.2e-5, concreto 1.0e-5. Se usa en las cargas térmicas.")
+
     st.subheader("Cuadrícula de dibujo")
     c1, c2 = st.columns(2)
     c1.number_input("Paso x (m)", key="dx", min_value=0.05, step=0.25)
@@ -601,35 +864,49 @@ with tab_tab:
                "Cargas: + en el sentido positivo del eje (global_y negativo = hacia abajo).")
     num = lambda lbl, fmt="%g": st.column_config.NumberColumn(lbl, format=fmt)
     ids = lambda lbl: st.column_config.NumberColumn(lbl, format="%d", step=1)
+    caso_col = st.column_config.TextColumn("Caso", default=motor.CASO_DEF, help="Caso de carga: CM, CV, VIENTO, SISMO...")
     config = {
         "nodos": {"id": ids("Nodo"), "x": num("x (m)"), "y": num("y (m)")},
         "barras": {"id": ids("Barra"), "i": ids("Nodo i"), "j": ids("Nodo j"), "E": num("E (kPa)", "%.4g"),
                    "A": num("A (m²)", "%.4g"), "I": num("I (m⁴)", "%.4g"),
                    "art_i": st.column_config.CheckboxColumn("Articulado en i"),
-                   "art_j": st.column_config.CheckboxColumn("Articulado en j")},
+                   "art_j": st.column_config.CheckboxColumn("Articulado en j"),
+                   "gamma": num("γ (kN/m³)")},
         "apoyos": {"nodo": ids("Nodo"), "rx": st.column_config.CheckboxColumn("Restringe x"),
                    "ry": st.column_config.CheckboxColumn("Restringe y"),
                    "rz": st.column_config.CheckboxColumn("Restringe giro")},
         "resortes": {"nodo": ids("Nodo"), "kx": num("kx (kN/m)"), "ky": num("ky (kN/m)"), "kz": num("kz (kN·m/rad)")},
-        "cargas_nodales": {"nodo": ids("Nodo"), "Fx": num("Fx (kN)"), "Fy": num("Fy (kN)"), "M": num("M (kN·m)")},
+        "cargas_nodales": {"nodo": ids("Nodo"), "Fx": num("Fx (kN)"), "Fy": num("Fy (kN)"), "M": num("M (kN·m)"),
+                           "caso": caso_col},
         "cargas_barras": {"barra": ids("Barra"),
                           "tipo": st.column_config.SelectboxColumn("Tipo", options=TIPOS_CARGA, default="distribuida"),
                           "dir": st.column_config.SelectboxColumn("Dirección", options=DIRS, default="global_y"),
                           "w1": num("w1 (kN/m)"), "w2": num("w2 (kN/m)"), "a": num("a (m)"), "b": num("b (m)"),
-                          "P": num("P (kN)")},
+                          "P": num("P (kN)"), "M": num("M (kN·m)"), "dT": num("ΔT (°C)"), "dTg": num("ΔTg (°C)"),
+                          "h": num("h (m)"), "caso": caso_col},
         "asentamientos": {"nodo": ids("Nodo"), "dx": num("dx (m)"), "dy": num("dy (m)"), "giro": num("giro (rad)")},
+        "combinaciones": {"nombre": st.column_config.TextColumn("Nombre"),
+                          "factores": st.column_config.TextColumn("Factores", help="Ejemplo: 1.3 CM + 1.5 CV")},
     }
     titulos = {"nodos": "Nodos", "barras": "Barras", "apoyos": "Apoyos", "cargas_nodales": "Cargas en nodos",
-               "cargas_barras": "Cargas en barras", "resortes": "Resortes", "asentamientos": "Asentamientos"}
+               "cargas_barras": "Cargas en barras", "resortes": "Resortes", "asentamientos": "Asentamientos",
+               "combinaciones": "Combinaciones de carga"}
     ca, cb = st.columns(2)
     for k, nombre in enumerate(["nodos", "apoyos", "barras", "cargas_nodales", "cargas_barras", "resortes",
-                                "asentamientos"]):
+                                "asentamientos", "combinaciones"]):
         col = ca if nombre in ("nodos", "apoyos", "cargas_nodales", "resortes") else cb
         with col:
             st.markdown(f"**{titulos[nombre]}**")
             if nombre == "cargas_barras":
                 st.caption("Distribuida: w1, w2 (opcional), a y b en m desde el nodo i (opcionales). "
-                           "Puntual: P y a.")
+                           "Puntual: P y a. Momento: M (+ antihorario) y a. "
+                           "Térmica: ΔT uniforme y/o ΔTg (cara +y local menos cara -y local) con el peralte h.")
+            if nombre == "combinaciones":
+                st.caption("Cada carga pertenece a un caso (columna Caso; vacío = CM). Escribe los factores como "
+                           "`1.3 CM + 1.5 CV`. Sin combinaciones se analizan todas las cargas con factor 1. "
+                           "Los asentamientos entran con factor 1 en todas.")
+                st.button("Agregar Servicio (1 CM + 1 CV) y Resistencia (1.3 CM + 1.5 CV)", on_click=_cb_combos_tipicas,
+                          help="Factores de ejemplo: ajústalos a tu reglamento.")
             df = st.data_editor(ss.base[nombre], key=f"ed_{nombre}_{ss.ver}", num_rows="dynamic",
                                 column_config=config[nombre], hide_index=True, width="stretch")
             ss.tablas[nombre] = _tipar(nombre, df)
@@ -645,7 +922,7 @@ with tab_dib:
             "Nodo": "Toca un punto de la cuadrícula.",
             "Barra": "Toca el nodo inicial y luego el final. Si tocas la cuadrícula se crea el nodo.",
             "Apoyo": "Elige el tipo y toca un nodo.",
-            "Carga en nodo": "Define la carga y toca un nodo. Con todo en cero se borran sus cargas.",
+            "Carga en nodo": "Define la carga y toca un nodo. Con todo en cero se borran sus cargas de ese caso.",
             "Carga en barra": "Define la carga y toca el rombo naranja de la barra.",
             "Articulación": "Toca un nodo para articular todas las barras que llegan, o el rombo de una barra "
                             "para elegir el extremo.",
@@ -667,16 +944,27 @@ with tab_dib:
             op["Fx"] = st.number_input("Fx (kN)", value=0.0)
             op["Fy"] = st.number_input("Fy (kN)", value=-10.0)
             op["M"] = st.number_input("M (kN·m, + antihorario)", value=0.0)
+            op["caso"] = st.text_input("Caso de carga", value=motor.CASO_DEF, key="caso_nodo")
         elif modo == "Carga en barra":
             op["tipo"] = st.selectbox("Tipo", TIPOS_CARGA)
-            op["dir"] = st.selectbox("Dirección", DIRS,
-                                     help="global_y_proy: por metro de proyección horizontal (techos inclinados).")
+            if op["tipo"] in ("distribuida", "puntual"):
+                op["dir"] = st.selectbox("Dirección", DIRS,
+                                         help="global_y_proy: por metro de proyección horizontal (techos inclinados).")
             if op["tipo"] == "distribuida":
                 op["w1"] = st.number_input("w1 (kN/m)", value=-10.0)
                 op["w2"] = st.number_input("w2 (kN/m)", value=op["w1"])
-            else:
+            elif op["tipo"] == "puntual":
                 op["P"] = st.number_input("P (kN)", value=-10.0)
                 op["a"] = st.number_input("a (m desde el nodo i)", value=1.0, min_value=0.0)
+            elif op["tipo"] == "momento":
+                op["M"] = st.number_input("M (kN·m, + antihorario)", value=10.0)
+                op["a"] = st.number_input("a (m desde el nodo i)", value=1.0, min_value=0.0)
+            else:
+                op["dT"] = st.number_input("ΔT uniforme (°C)", value=20.0)
+                op["dTg"] = st.number_input("ΔTg: cara +y menos cara -y (°C)", value=0.0,
+                                            help="En una viga trazada de izquierda a derecha, +y es la cara superior.")
+                op["h"] = st.number_input("Peralte h (m)", value=0.30, min_value=0.01)
+            op["caso"] = st.text_input("Caso de carga", value=motor.CASO_DEF, key="caso_barra")
         elif modo == "Articulación":
             op["extremo"] = st.radio("Al tocar una barra", ["Extremo i", "Extremo j", "Ambos extremos"])
         if modo != "Barra" and ss.pendiente is not None:
@@ -708,26 +996,23 @@ with tab_dib:
                     ss.msg = ("info", msg)
                 st.rerun()
         st.caption("Azul: nodos. Rombos naranjas: barras (tócalos para cargarlas, articularlas o borrarlas). "
-                   "Círculos blancos: articulaciones. Nodo rojo: inicio del trazo actual.")
+                   "Círculos blancos: articulaciones. Nodo rojo: inicio del trazo actual. "
+                   "Se dibujan las cargas de todos los casos; el peso propio no se dibuja.")
 
 # ---- Resultados ----
 with tab_res:
-    modelo, avisos = tablas_a_modelo(ss.tablas, ss.E_def, ss.A_def, ss.I_def, ss.titulo)
+    modelo, avisos = tablas_a_modelo(ss.tablas, ss.E_def, ss.A_def, ss.I_def, ss.titulo, _extra())
     firma = json.dumps(modelo, sort_keys=True, default=str)
     for a in avisos:
         st.warning(a)
     if st.button("Calcular", type="primary"):
         try:
-            with st.spinner("Resolviendo el sistema y armando el PDF..."):
-                res = motor.analizar(modelo)
-                buf = io.BytesIO()
-                motor.generar_pdf(res, buf)
-            ss.res = {"res": res, "pdf": buf.getvalue(), "firma": firma,
-                      "figs": {"Modelo": motor.fig_modelo(res).getvalue(),
-                               "Deformada": motor.fig_deformada(res).getvalue(),
-                               "Axial N": motor.fig_diagrama(res, "N").getvalue(),
-                               "Cortante V": motor.fig_diagrama(res, "V").getvalue(),
-                               "Momento M": motor.fig_diagrama(res, "M").getvalue()}}
+            with st.spinner("Resolviendo el sistema..."):
+                todos = motor.analizar_combinaciones(modelo)
+                env = motor.envolvente(todos) if len(todos) > 1 else None
+                xls = io.BytesIO()
+                motor.exportar_excel(todos, xls, env)
+            ss.res = {"todos": todos, "env": env, "excel": xls.getvalue(), "firma": firma, "cache": {}}
         except motor.ErrorEstructura as e:
             ss.res = None
             st.error(f"Revisa el modelo: {e}")
@@ -735,29 +1020,88 @@ with tab_res:
             ss.res = None
             st.error(f"Error inesperado al calcular: {e}")
 
-    if ss.get("res"):
+    if ss.get("res") and "todos" in ss.res:
         R = ss.res
-        res = R["res"]
         if R["firma"] != firma:
             st.warning("El modelo cambió después del último cálculo. Presiona Calcular para actualizar.")
+        nombres = list(R["todos"])
+        env = R["env"]
+        cs1, cs2 = st.columns([2, 1])
+        if len(nombres) > 1:
+            combo = cs1.selectbox("Combinación de carga", nombres, key="sel_combo",
+                                  format_func=lambda n: f"{n}:  {motor.texto_combinacion(R['todos'][n]['factores'])}")
+            if combo not in R["todos"]:
+                combo = nombres[0]
+        else:
+            combo = nombres[0]
+            cs1.caption("Sin combinaciones definidas: se analizaron todas las cargas con factor 1. "
+                        "Puedes definirlas en la pestaña Tablas.")
+        limite = cs2.number_input("Límite de flecha L / n", value=240, min_value=50, step=10,
+                                  help="Con qué límite se revisa la flecha de cada barra (240, 360, 480...). "
+                                       "Usa el que marque tu reglamento.")
+        res = R["todos"][combo]
+
+        clave_cache = (combo, int(limite))
+        if clave_cache not in R["cache"]:
+            with st.spinner("Armando el PDF y los diagramas..."):
+                buf = io.BytesIO()
+                motor.generar_pdf(res, buf, env=env, limite_flecha=limite)
+                R["cache"][clave_cache] = {
+                    "pdf": buf.getvalue(),
+                    "figs": {"Modelo": motor.fig_modelo(res).getvalue(),
+                             "Deformada": motor.fig_deformada(res).getvalue(),
+                             "Axial N": motor.fig_diagrama(res, "N").getvalue(),
+                             "Cortante V": motor.fig_diagrama(res, "V").getvalue(),
+                             "Momento M": motor.fig_diagrama(res, "M").getvalue()}}
+        salida = R["cache"][clave_cache]
+
         GI = res["GI"]
         clas = "Determinada" if GI == 0 else f"Indeterminada (grado {GI})" if GI > 0 else "Revisar"
-        umax = max(float(np.max(np.hypot(m["def_u"] * m["c"] - m["def_v"] * m["s"],
-                                         m["def_u"] * m["s"] + m["def_v"] * m["c"]))) for m in res["miembros"]) * 1000
-        sfx, sfy, sm = res["equilibrio"]
+        umax = max(m["desp_max"][0] for m in res["miembros"]) * 1000
+        peor = min(res["miembros"], key=lambda m: m["flecha"]["relacion"])
+        rel = peor["flecha"]["relacion"]
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Grado de indeterminación", f"GI = {GI}", help=clas)
         m2.metric("Desplazamiento máx.", f"{umax:.3f} mm", help="Incluye puntos intermedios de las barras.")
         m3.metric("|M| máximo", f"{max(max(abs(m['M_max'][0]), abs(m['M_min'][0])) for m in res['miembros']):.2f} kN·m")
-        m4.metric("Equilibrio", "Cumple" if max(abs(sfx), abs(sfy), abs(sm)) < 1e-6 * res["escala_f"] * 100 else "Revisar")
-        st.download_button("Descargar PDF con el desarrollo", R["pdf"], file_name="analisis_matricial.pdf",
-                           mime="application/pdf", type="primary")
+        m4.metric("Flecha crítica", "sin flecha" if math.isinf(rel) else f"L/{rel:.0f}",
+                  delta=None if math.isinf(rel) else ("cumple" if rel >= limite else "excede"),
+                  delta_color="normal" if rel >= limite else "inverse",
+                  help=f"Barra {peor['id']}: flecha relativa a la cuerda entre sus extremos.")
+        if not motor.equilibrio_ok(res):
+            st.error("El equilibrio global no cierra: revisa el modelo.")
 
-        tabs_fig = st.tabs(list(R["figs"]))
-        for tf, (nombre, png) in zip(tabs_fig, R["figs"].items()):
+        d1, d2 = st.columns(2)
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", combo).strip("_") or "resultado"
+        d1.download_button("Descargar PDF con el desarrollo", salida["pdf"], file_name=f"analisis_matricial_{slug}.pdf",
+                           mime="application/pdf", type="primary", width="stretch")
+        d2.download_button("Descargar resultados en Excel", R["excel"], file_name="analisis_matricial.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
+                           help="Todas las combinaciones: desplazamientos, reacciones, elementos mecánicos, "
+                                "valores por estaciones y envolvente.")
+
+        tabs_fig = st.tabs(list(salida["figs"]))
+        for tf, (nombre, png) in zip(tabs_fig, salida["figs"].items()):
             with tf:
                 st.image(png, width="stretch")
 
+        st.subheader("Detalle por barra")
+        ids_b = [m["id"] for m in res["miembros"]]
+        bsel = st.selectbox("Barra", ids_b, key="sel_barra",
+                            format_func=lambda b: f"Barra {b}")
+        mb = res["miembros"][ids_b.index(bsel) if bsel in ids_b else 0]
+        st.plotly_chart(figura_barra(mb, env["barras"][mb["id"]] if env else None), theme=None,
+                        config={"displayModeBar": False, "scrollZoom": False}, key=f"det_{combo}_{mb['id']}")
+        if env:
+            st.caption("Líneas punteadas grises: envolvente (máximo y mínimo) de todas las combinaciones.")
+        with st.expander("Valores por estaciones de esta barra"):
+            n_est = st.slider("Número de estaciones", 3, 41, 11, step=2)
+            e = motor.estaciones(mb, n_est)
+            st.dataframe(pd.DataFrame({"x (m)": e["x"], "N (kN)": e["N"], "V (kN)": e["V"], "M (kN·m)": e["M"],
+                                       "u local (mm)": e["u"] * 1000, "v local (mm)": e["v"] * 1000}).round(4),
+                         hide_index=True, width="stretch")
+
+        st.subheader("Tablas de resultados")
         idx = res["idx"]
         c1, c2 = st.columns(2)
         with c1:
@@ -784,10 +1128,36 @@ with tab_res:
                                     "M máx": m["M_max"][0], "x M máx (m)": m["M_max"][1],
                                     "M mín": m["M_min"][0], "x M mín (m)": m["M_min"][1]} for m in res["miembros"]]),
                      hide_index=True, width="stretch")
+        st.markdown("**Flechas por barra** (relativas a la cuerda entre los extremos de la barra)")
+        st.dataframe(pd.DataFrame([{"Barra": m["id"], "L (m)": m["L"], "Flecha (mm)": m["flecha"]["valor"] * 1000,
+                                    "x (m)": m["flecha"]["x"],
+                                    "L / flecha": None if math.isinf(m["flecha"]["relacion"]) else round(m["flecha"]["relacion"]),
+                                    f"Límite L/{int(limite)}": "Cumple" if m["flecha"]["relacion"] >= limite else "Excede",
+                                    "Desp. total máx. (mm)": m["desp_max"][0] * 1000} for m in res["miembros"]]),
+                     hide_index=True, width="stretch")
+        st.caption("En voladizos revisa el desplazamiento total del extremo libre en lugar de la flecha relativa.")
+
+        if env:
+            st.subheader("Envolvente de combinaciones")
+            filas = []
+            for bid, d in env["barras"].items():
+                for clave, un in (("N", "N (kN)"), ("V", "V (kN)"), ("M", "M (kN·m)")):
+                    e = d[clave]
+                    filas.append({"Barra": bid, "Efecto": un, "Máximo": e["max"], "x máx (m)": e["x_max"],
+                                  "Combinación máx": e["combo_max"], "Mínimo": e["min"], "x mín (m)": e["x_min"],
+                                  "Combinación mín": e["combo_min"]})
+            st.dataframe(pd.DataFrame(filas), hide_index=True, width="stretch")
+            if env["reacciones"]:
+                comp = ["Rx (kN)", "Ry (kN)", "Mz (kN·m)"]
+                st.markdown("**Reacciones extremas**")
+                st.dataframe(pd.DataFrame([{"Nodo": n_, "Componente": comp[q], "Máxima": v[0], "Combinación máx": v[1],
+                                            "Mínima": v[2], "Combinación mín": v[3]}
+                                           for (n_, q), v in env["reacciones"].items()]),
+                             hide_index=True, width="stretch")
     else:
         st.info("Presiona Calcular para resolver la estructura.")
 
 # El botón de guardar va al final para incluir las ediciones hechas en esta misma ejecución
-mod_actual, _ = tablas_a_modelo(ss.tablas, ss.E_def, ss.A_def, ss.I_def, ss.titulo)
+mod_actual, _ = tablas_a_modelo(ss.tablas, ss.E_def, ss.A_def, ss.I_def, ss.titulo, _extra())
 zona_guardar.download_button("Guardar modelo (.json)", json.dumps(mod_actual, indent=2, ensure_ascii=False),
                              file_name="modelo_estructura.json", mime="application/json", width="stretch")
